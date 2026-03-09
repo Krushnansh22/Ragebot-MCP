@@ -19,3 +19,6 @@ keyring>=24.0.0
 
 # .env file support
 python-dotenv>=1.0.0
+
+# Document summarisation (extractive)
+nltk>=3.8.0

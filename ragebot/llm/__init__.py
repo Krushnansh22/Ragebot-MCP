@@ -1,1 +1,1 @@
-"""LLM provider implementations — Gemini and Grok."""
+"""LLM provider implementations — Gemini and Groq."""

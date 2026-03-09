@@ -39,8 +39,8 @@ This guide covers every way to deploy RageBot MCP so any MCP-compatible AI clien
 ### Option A — Install from source (recommended for development)
 
 ```bash
-git clone https://github.com/ragebot/mcp
-cd mcp
+git clone https://github.com/atharvrahate296/Ragebot-MCP
+cd Ragebot-MCP
 
 # Create virtual environment
 python -m venv .venv

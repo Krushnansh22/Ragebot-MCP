@@ -2,7 +2,7 @@
 Gemini LLM Provider
 ────────────────────
 Uses google-generativeai SDK.
-API key is retrieved from the OS keyring (set via `rage auth login gemini`).
+API key is retrieved from the OS keyring (set via `rage auth`).
 Falls back gracefully when the SDK is not installed.
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ def _check_sdk() -> bool:
 
 
 class GeminiProvider(BaseLLMProvider):
-    def __init__(self, api_key: str, model: str = "gemini-1.5-flash") -> None:
+    def __init__(self, api_key: str, model: str = "gemini-2.0-flash") -> None:
         self._api_key = api_key
         self._model   = model
         self._client  = None
@@ -56,7 +56,7 @@ class GeminiProvider(BaseLLMProvider):
                 "Run:  pip install google-generativeai  or  pip install 'ragebot-mcp[gemini]'"
             )
         if not self._api_key:
-            return "⚠️  No Gemini API key. Run:  rage auth login gemini"
+            return "⚠️  No Gemini API key. Run:  rage auth  to set up your provider."
         client = self._get_client()
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
         try:

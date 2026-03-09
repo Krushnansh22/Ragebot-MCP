@@ -27,12 +27,12 @@ SECRETS_FILE = CONFIG_DIR / ".secrets"   # chmod-600 fallback when keyring unava
 KEYRING_SERVICE = "ragebot-mcp"
 
 # Keys that must never appear in config.json
-_SECRET_KEYS: set[str] = {"gemini_api_key", "grok_api_key"}
+_SECRET_KEYS: set[str] = {"gemini_api_key", "groq_api_key"}
 
 # Env-var → config-key mapping
 _ENV_MAP: dict[str, str] = {
     "GEMINI_API_KEY":          "gemini_api_key",
-    "GROK_API_KEY":            "grok_api_key",
+    "GROQ_API_KEY":            "groq_api_key",
     "RAGEBOT_LLM_PROVIDER":    "llm_provider",
     "RAGEBOT_EMBEDDING_MODEL": "embedding_model",
     "RAGEBOT_MCP_TRANSPORT":   "mcp_transport",
@@ -43,10 +43,10 @@ _ENV_MAP: dict[str, str] = {
 # ── Non-secret defaults ───────────────────────────────────────────────────────
 DEFAULTS: dict[str, str] = {
     # LLM
-    "llm_provider":        "gemini",        # gemini | grok | none
-    "gemini_model":        "gemini-1.5-flash",
-    "grok_model":          "grok-3-mini",
-    "grok_base_url":       "https://api.x.ai/v1",
+    "llm_provider":        "gemini",        # gemini | groq | none
+    "gemini_model":        "gemini-2.0-flash",
+    "groq_model":          "openai/gpt-oss-120b",
+    "groq_base_url":       "https://api.groq.com/openai/v1",
     # Embeddings
     "embedding_model":     "all-MiniLM-L6-v2",
     "embedding_batch_size":"32",
@@ -57,7 +57,7 @@ DEFAULTS: dict[str, str] = {
     "chunk_size":          "512",
     "chunk_overlap":       "64",
     "index_depth":         "10",
-    "ignore_patterns":     ".git,node_modules,__pycache__,.venv,venv,dist,build,.DS_Store,*.pyc,*.egg-info,.ragebot",
+    "ignore_patterns":     ".git,node_modules,__pycache__,.venv,venv,env,ENV,dist,build,.DS_Store,*.pyc,*.egg-info,.ragebot,.pytest_cache,.mypy_cache,.ruff_cache,.tox,.nox",
     # Output
     "default_mode":        "smart",         # minimal | smart | full
     "output_format":       "rich",

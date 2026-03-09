@@ -1,22 +1,22 @@
 """
-Grok LLM Provider (xAI)
-────────────────────────
-Grok exposes an OpenAI-compatible REST API endpoint at https://api.x.ai/v1.
+Groq LLM Provider
+──────────────────
+Groq exposes an OpenAI-compatible REST API endpoint at https://api.groq.com/openai/v1.
 We use the openai Python SDK pointing at that base URL so no extra dependency
 is needed beyond `openai`.
-API key is retrieved from the OS keyring (set via `rage auth login grok`).
+API key is retrieved from the OS keyring (set via `rage auth`).
 """
 from __future__ import annotations
 
 from ragebot.llm.base import BaseLLMProvider
 
 
-class GrokProvider(BaseLLMProvider):
+class GroqProvider(BaseLLMProvider):
     def __init__(
         self,
         api_key: str,
-        model: str = "grok-3-mini",
-        base_url: str = "https://api.x.ai/v1",
+        model: str = "openai/gpt-oss-120b",
+        base_url: str = "https://api.groq.com/openai/v1",
     ) -> None:
         self._api_key  = api_key
         self._model    = model
@@ -25,7 +25,7 @@ class GrokProvider(BaseLLMProvider):
 
     @property
     def name(self) -> str:
-        return f"Grok/{self._model}"
+        return f"Groq/{self._model}"
 
     def is_available(self) -> bool:
         return bool(self._api_key)
@@ -57,4 +57,4 @@ class GrokProvider(BaseLLMProvider):
             )
             return response.choices[0].message.content or ""
         except Exception as exc:
-            return f"[Grok error: {exc}]"
+            return f"[Groq error: {exc}]"

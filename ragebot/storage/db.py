@@ -27,6 +27,7 @@ class Database:
         return self._conn
 
     def init_schema(self) -> None:
+        """Initialize all required tables for RageBot."""
         with self.conn:
             self.conn.executescript("""
                 CREATE TABLE IF NOT EXISTS files (
@@ -178,12 +179,24 @@ class Database:
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     def get_stats(self) -> dict:
-        fc  = self.conn.execute("SELECT COUNT(*) as c FROM files").fetchone()["c"]
-        cc  = self.conn.execute("SELECT COUNT(*) as c FROM chunks").fetchone()["c"]
-        ts  = self.conn.execute("SELECT MAX(indexed_at) as t FROM files").fetchone()["t"]
-        tcs = self.conn.execute(
-            "SELECT file_type, COUNT(*) as c FROM files GROUP BY file_type"
-        ).fetchall()
+        """Get project storage statistics, safely handling missing tables."""
+        try:
+            fc_row = self.conn.execute("SELECT COUNT(*) as c FROM files").fetchone()
+            fc = fc_row["c"] if fc_row else 0
+            
+            cc_row = self.conn.execute("SELECT COUNT(*) as c FROM chunks").fetchone()
+            cc = cc_row["c"] if cc_row else 0
+            
+            ts_row = self.conn.execute("SELECT MAX(indexed_at) as t FROM files").fetchone()
+            ts = ts_row["t"] if ts_row else None
+            
+            tcs = self.conn.execute(
+                "SELECT file_type, COUNT(*) as c FROM files GROUP BY file_type"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Tables might not exist yet
+            return {"total_files": 0, "total_chunks": 0, "last_updated": "Never"}
+
         result: dict = {
             "total_files":  fc,
             "total_chunks": cc,

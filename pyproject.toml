@@ -25,6 +25,8 @@ dependencies = [
     "keyring>=24.0.0",
     # .env file loading
     "python-dotenv>=1.0.0",
+    # Document summarisation (extractive)
+    "nltk>=3.8.0",
 ]
 
 # ── Optional extras ───────────────────────────────────────────────────────────

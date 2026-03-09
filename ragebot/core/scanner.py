@@ -1,5 +1,6 @@
 """
 Directory Scanner - Recursively scans and classifies project files.
+Smart ignore system prevents scanning virtual environments and heavy directories.
 """
 from __future__ import annotations
 
@@ -8,6 +9,32 @@ from pathlib import Path
 from typing import Generator, List
 
 from ragebot.core.config import ConfigManager
+
+
+# ── Always-ignored directories (never indexed, never traversed) ───────────────
+# These are unconditionally skipped regardless of config — prevents hangs
+# when scanning large virtualenvs or node_modules trees.
+ALWAYS_IGNORE_DIRS: set[str] = {
+    # Python virtual environments
+    "env", "venv", ".venv", ".env", "ENV", "Env",
+    ".conda", "conda-env",
+    # JS / Node
+    "node_modules", ".npm", "bower_components",
+    # Version control
+    ".git", ".hg", ".svn",
+    # Python build artefacts
+    "__pycache__", ".eggs", "dist", "build",
+    "*.egg-info",
+    # IDE / editor
+    ".vscode", ".idea", ".vs",
+    # RageBot's own data
+    ".ragebot",
+    # OS junk
+    ".DS_Store", "Thumbs.db",
+    # Test / lint caches
+    ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    "htmlcov", ".tox", ".nox",
+}
 
 
 # File type classification
@@ -25,6 +52,22 @@ ASSET_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".mp4",
     ".mp3", ".wav", ".ttf", ".woff", ".woff2",
 }
+
+
+def _looks_like_virtualenv(path: Path) -> bool:
+    """Heuristic: detect virtualenv directories by marker files."""
+    if not path.is_dir():
+        return False
+    # Standard virtualenv / venv marker
+    if (path / "pyvenv.cfg").exists():
+        return True
+    # Windows virtualenv layout
+    if (path / "Lib" / "site-packages").is_dir():
+        return True
+    # Unix virtualenv layout
+    if (path / "lib").is_dir() and (path / "bin" / "activate").exists():
+        return True
+    return False
 
 
 class DirectoryScanner:
@@ -85,19 +128,27 @@ class DirectoryScanner:
 
     def _should_ignore(self, path: Path) -> bool:
         name = path.name
-        rel = str(path.relative_to(self.root))
 
+        # ── 1. Always-ignore list (fast, unconditional) ───────────────────
+        if name in ALWAYS_IGNORE_DIRS:
+            return True
+
+        # ── 2. Heuristic virtualenv detection ─────────────────────────────
+        if path.is_dir() and _looks_like_virtualenv(path):
+            return True
+
+        # ── 3. Config-based ignore patterns ───────────────────────────────
+        rel = str(path.relative_to(self.root))
         for pattern in self._ignore_patterns:
             if fnmatch.fnmatch(name, pattern):
                 return True
             if fnmatch.fnmatch(rel, pattern):
                 return True
-            # Exact directory name match
             if path.is_dir() and name == pattern:
                 return True
 
-        # Hidden files/dirs (except .env)
-        if name.startswith(".") and name not in (".env", ".gitignore"):
+        # ── 4. Hidden files/dirs (except known safe ones) ─────────────────
+        if name.startswith(".") and name not in (".gitignore",):
             return True
 
         return False

@@ -1,5 +1,10 @@
 """
-Document Parser - Extracts and chunks content from PDF, DOCX, MD, and TXT files.
+Document Parser — Extracts, chunks, and *summarises* content from
+PDF, DOCX, MD, and TXT files.
+
+Summarisation strategy (in priority order):
+  1. NLTK extractive summariser (sentence scoring by TF-IDF-ish frequency)
+  2. Simple first-paragraph fallback
 """
 from __future__ import annotations
 
@@ -7,6 +12,65 @@ import re
 from pathlib import Path
 from typing import Any
 
+
+# ── NLTK Summariser ───────────────────────────────────────────────────────────
+
+def _ensure_nltk_data() -> bool:
+    """Download required NLTK data on first use.  Returns True if NLTK is usable."""
+    try:
+        import nltk  # type: ignore
+        for resource in ("punkt", "punkt_tab", "stopwords"):
+            try:
+                nltk.data.find(f"tokenizers/{resource}" if "punkt" in resource else f"corpora/{resource}")
+            except LookupError:
+                nltk.download(resource, quiet=True)
+        return True
+    except Exception:
+        return False
+
+
+def _nltk_summarise(text: str, sentence_count: int = 5) -> str:
+    """Extractive summary using NLTK sentence + word frequency scoring."""
+    try:
+        import nltk  # type: ignore
+        from nltk.corpus import stopwords  # type: ignore
+        from nltk.tokenize import sent_tokenize, word_tokenize  # type: ignore
+
+        if not _ensure_nltk_data():
+            return ""
+
+        stops = set(stopwords.words("english"))
+        sentences = sent_tokenize(text)
+        if len(sentences) <= sentence_count:
+            return text[:1500]
+
+        # Word frequency table (excluding stopwords)
+        word_freq: dict[str, int] = {}
+        for word in word_tokenize(text.lower()):
+            if word.isalnum() and word not in stops:
+                word_freq[word] = word_freq.get(word, 0) + 1
+
+        if not word_freq:
+            return text[:1500]
+
+        max_freq = max(word_freq.values())
+        for w in word_freq:
+            word_freq[w] /= max_freq  # normalise 0-1
+
+        # Score each sentence
+        scored: list[tuple[float, int, str]] = []
+        for idx, sent in enumerate(sentences):
+            score = sum(word_freq.get(w, 0) for w in word_tokenize(sent.lower()) if w.isalnum())
+            scored.append((score, idx, sent))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = sorted(scored[:sentence_count], key=lambda x: x[1])  # restore doc order
+        return " ".join(s for _, _, s in top)
+    except Exception:
+        return ""
+
+
+# ── Document Parser ───────────────────────────────────────────────────────────
 
 class DocumentParser:
     def parse(self, file_path: Path) -> dict:
@@ -41,7 +105,7 @@ class DocumentParser:
                 with pdfplumber.open(str(path)) as pdf:
                     text = "\n".join(p.extract_text() or "" for p in pdf.pages)
             except ImportError:
-                text = f"[PDF parsing unavailable. Install PyMuPDF: pip install pymupdf]"
+                text = "[PDF parsing unavailable. Install PyMuPDF: pip install pymupdf]"
         except Exception as e:
             text = f"[PDF parsing error: {e}]"
 
@@ -110,10 +174,23 @@ class DocumentParser:
             "chunk_count": len(chunks),
         }
 
-    def _extract_summary(self, text: str, max_chars: int = 300) -> str:
-        """Extract the first meaningful paragraph as a summary."""
+    def _extract_summary(self, text: str, max_chars: int = 500) -> str:
+        """
+        Produce a summary of the document text.
+
+        Strategy:
+          1. Try NLTK extractive summariser (picks the most informative sentences)
+          2. Fall back to first meaningful paragraph
+        """
         if not text:
             return ""
+
+        # ── Attempt NLTK ──────────────────────────────────────────────────
+        nltk_summary = _nltk_summarise(text, sentence_count=5)
+        if nltk_summary and len(nltk_summary) > 50:
+            return nltk_summary[:max_chars]
+
+        # ── Fallback: first paragraph ─────────────────────────────────────
         paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
         for para in paragraphs:
             if len(para) > 50:

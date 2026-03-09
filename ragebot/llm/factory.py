@@ -18,15 +18,15 @@ def get_provider(config: "ConfigManager") -> "BaseLLMProvider":
         from ragebot.llm.gemini import GeminiProvider
         return GeminiProvider(
             api_key=config.get("gemini_api_key", ""),
-            model=config.get("gemini_model", "gemini-1.5-flash"),
+            model=config.get("gemini_model", "gemini-2.0-flash"),
         )
 
-    if provider_name == "grok":
-        from ragebot.llm.grok import GrokProvider
-        return GrokProvider(
-            api_key=config.get("grok_api_key", ""),
-            model=config.get("grok_model", "grok-3-mini"),
-            base_url=config.get("grok_base_url", "https://api.x.ai/v1"),
+    if provider_name == "groq":
+        from ragebot.llm.groq import GroqProvider
+        return GroqProvider(
+            api_key=config.get("groq_api_key", ""),
+            model=config.get("groq_model", "openai/gpt-oss-120b"),
+            base_url=config.get("groq_base_url", "https://api.groq.com/openai/v1"),
         )
 
     # Fallback: no-op provider

@@ -13,5 +13,5 @@ class NoopProvider(BaseLLMProvider):
     def complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 1000) -> str:
         return (
             "⚠️  No LLM provider configured. "
-            "Run `rage auth login gemini` or `rage auth login grok` to set up a provider."
+            "Run `rage auth` to set up a provider (Gemini or Groq)."
         )
