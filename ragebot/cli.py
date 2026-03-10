@@ -18,13 +18,13 @@ from rich import print as rprint
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.prompt import Confirm, Prompt
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, MofNCompleteColumn
-from rich.prompt import Prompt
 from rich.syntax import Syntax
 from rich.table import Table
 
-from ragebot.core.config  import ConfigManager
-from ragebot.core.engine  import RageBotEngine
+from ragebot.core.config   import ConfigManager
+from ragebot.core.engine   import RageBotEngine
 from ragebot.utils.display import Display
 import questionary
 
@@ -111,28 +111,115 @@ def _get_model_category(model_id: str) -> tuple[str, str]:
 
 def _select_model(provider: str) -> str:
     from ragebot.llm.models import PROVIDER_MODELS, PROVIDER_DEFAULTS
-    models = PROVIDER_MODELS.get(provider, [])
+    models        = PROVIDER_MODELS.get(provider, [])
     default_model = PROVIDER_DEFAULTS.get(provider, "")
     if not models:
         return default_model
-    
-    choices = [
-        questionary.Choice(title=f"{m['name']} ({m['id']})", value=m["id"])
-        for m in models
-    ]
-    
-    selected_id = questionary.select(
-         f"Select a model for {provider.title()}:",
-         choices=choices,
-         default=default_model if any(m["id"] == default_model for m in models) else None
-    ).ask()
-    
-    if not selected_id:
-        selected_id = models[0]["id"]
-        
-    selected = next(m for m in models if m["id"] == selected_id)
+
+    console.print(Panel(f"[bold]Choose a model for [cyan]{provider.title()}[/cyan][/bold]", border_style="cyan", padding=(0, 2)))
+    current_cat = ""
+    for i, m in enumerate(models, 1):
+        cat_name, cat_color = _get_model_category(m["id"])
+        if cat_name != current_cat:
+            current_cat = cat_name
+            console.print(Rule(f"[bold {cat_color}]{cat_name}[/bold {cat_color}]", style=cat_color))
+        default_badge = "  [black on green] DEFAULT [/black on green]" if m["id"] == default_model else ""
+        console.print(f"  [bold yellow]{i:>2}[/bold yellow]  │  [bold]{m['name']}[/bold]{default_badge}\n       │  [dim]{m['id']}[/dim]\n       │  {m['description']}")
+        console.print()
+    console.print(Rule(style="dim"))
+    choice   = Prompt.ask(f"[bold]Select model [dim](1-{len(models)}, default=1)[/dim][/bold]", default="1")
+    valid    = [str(i) for i in range(1, len(models) + 1)]
+    selected = models[int(choice) - 1] if choice in valid else models[0]
+
     console.print(Panel(f"[bold green]✓  {selected['name']}[/bold green]\n[dim]{selected['id']}[/dim]", border_style="green", title="[bold]Selected Model[/bold]", title_align="left", padding=(0, 2)))
     return selected_id
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# File-edit helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _show_diff_and_confirm(eng: RageBotEngine, file_path: str, instruction: str) -> None:
+    """
+    Ask the LLM for the modified file, show a coloured diff, then
+    prompt the user to confirm before writing to disk.
+    """
+    with _spin(f"Generating edit for {file_path}…"):
+        result = eng.apply_file_edit(file_path=file_path, instruction=instruction, write=False)
+
+    if "error" in result:
+        display.error(result["error"])
+        return
+
+    diff = result.get("diff", "")
+    if diff == "(no changes detected)":
+        display.info("The LLM produced no changes for that instruction.")
+        return
+
+    # Show the diff with syntax highlighting
+    console.print(Panel(
+        Syntax(diff, "diff", theme="monokai", line_numbers=False),
+        title=f"[bold yellow]Proposed changes to [cyan]{file_path}[/cyan][/bold yellow]",
+        border_style="yellow",
+    ))
+
+    if Confirm.ask("\n[bold]Write these changes to disk?[/bold]", default=False):
+        write_result = eng.apply_file_edit(
+            file_path=file_path, instruction=instruction, write=True
+        )
+        if write_result.get("written"):
+            display.success(
+                f"[bold]{file_path}[/bold] updated and re-indexed."
+            )
+        elif "error" in write_result:
+            display.error(write_result["error"])
+        else:
+            display.info("No changes written.")
+    else:
+        display.info("Changes discarded.")
+
+
+def _detect_edit_intent(
+    user_input: str,
+    eng: RageBotEngine,
+) -> tuple[str | None, str | None]:
+    """
+    Heuristically detect if the user wants to edit a file.
+
+    Returns (file_path, instruction) if an edit intent is detected,
+    otherwise (None, None).
+
+    Strategy:
+    - Look for verbs: add, insert, remove, delete, rename, replace, fix,
+      update, change, modify, refactor, append, prepend, comment
+    - Combined with a file mention in the same message.
+    """
+    import re
+    EDIT_VERBS = re.compile(
+        r"\b(add|insert|remove|delete|rename|replace|fix|update|change|"
+        r"modify|refactor|append|prepend|comment|put|write|move|rewrite)\b",
+        re.IGNORECASE,
+    )
+
+    from ragebot.search.retriever import extract_file_mentions
+
+    if not EDIT_VERBS.search(user_input):
+        return None, None
+
+    mentioned = extract_file_mentions(user_input)
+    if not mentioned:
+        return None, None
+
+    # Try to resolve the first mentioned file against the index
+    for mention in mentioned:
+        all_files = eng.db.get_all_files()
+        for f in all_files:
+            fp = f["file_path"].lower().replace("\\", "/")
+            mention_norm = mention.replace("\\", "/")
+            if fp.endswith(mention_norm) or mention_norm in fp:
+                return f["file_path"], user_input
+
+    return None, None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -176,8 +263,10 @@ def _run_interactive_repl():
         border_style="cyan", padding=(1, 3),
     ))
 
-    # eng = _engine(".") # Don't init engine yet, might need path arg for some commands
-    messages: list[dict] = []
+    # Each REPL run gets a stable session ID so context cache is keyed correctly
+    session_id = f"repl_{uuid.uuid4().hex[:12]}"
+    messages:  list[dict] = []
+    eng: RageBotEngine | None = None
 
     while True:
         try:
@@ -189,40 +278,33 @@ def _run_interactive_repl():
         if not raw_input:
             continue
 
-        # Strip 'rage ' prefix if user typed it
         input_stripped = raw_input
         if input_stripped.lower().startswith("rage "):
             input_stripped = input_stripped[5:].strip()
 
-        low = input_stripped.lower()
+        low   = input_stripped.lower()
         parts = input_stripped.split()
         cmd_name = parts[0].lower() if parts else ""
 
-        # ── Commands ──────────────────────────────────────────────────────
+        # ── Built-in commands ─────────────────────────────────────────────
         if low in ("exit", "quit", "/exit", "/quit", "/q"):
             console.print("[dim]Goodbye! 👋[/dim]")
             break
         elif cmd_name in ("/help", "help"):
-            _repl_help()
-            continue
+            _repl_help(); continue
         elif cmd_name == "version":
-            cmd_version()
-            continue
+            cmd_version(); continue
         elif cmd_name == "status":
             p = parts[1] if len(parts) > 1 else "."
-            cmd_status(path=p)
-            continue
+            cmd_status(path=p); continue
         elif cmd_name == "auth":
-            _do_auth_menu()
-            continue
+            _do_auth_menu(); continue
         elif cmd_name == "save":
             p = parts[1] if len(parts) > 1 else "."
-            cmd_save(path=p)
-            continue
+            cmd_save(path=p); continue
         elif cmd_name == "init":
             p = parts[1] if len(parts) > 1 else "."
-            cmd_init(path=p)
-            continue
+            cmd_init(path=p); continue
         elif cmd_name == "search":
             query = " ".join(parts[1:])
             if query: cmd_search(query=query)
@@ -244,29 +326,47 @@ def _run_interactive_repl():
             else: display.warning("Usage: test <file_path>")
             continue
         elif cmd_name == "config":
-            cfg_show()
-            continue
+            cfg_show(); continue
         elif cmd_name == "context":
             p = parts[1] if len(parts) > 1 else "."
-            cmd_context(path=p)
+            cmd_context(path=p); continue
+
+        # ── AI interaction ────────────────────────────────────────────────
+        # Lazily create engine on first non-command message
+        if eng is None:
+            eng = _engine(".")
+
+        if not (eng.project_path / ".ragebot").exists():
+            display.warning("Project not initialized. Please run [bold]init[/bold] first.")
+            continue
+
+        # ── Detect file-edit intent ───────────────────────────────────────
+        file_path, instruction = _detect_edit_intent(raw_input, eng)
+        if file_path and instruction:
+            _show_diff_and_confirm(eng, file_path, instruction)
+            # Add to history so context carries forward
+            messages.append({"role": "user",      "content": raw_input})
+            messages.append({"role": "assistant",  "content": f"[Edited {file_path}]"})
             continue
         elif cmd_name == "list":
             cmd_list()
             continue
 
-        # ── Question (default) ────────────────────────────────────────────
+        # ── Regular chat with history-aware retrieval ─────────────────────
         messages.append({"role": "user", "content": raw_input})
-        eng = _engine(".")
-        if not (eng.project_path / ".ragebot").exists():
-             display.warning("Project not initialized. Please run [bold]init[/bold] first.")
-             messages.pop()
-             continue
-             
         with _spin("Thinking…"):
             try:
-                response = eng.chat(messages=messages, top_k=5)
+                response = eng.chat(
+                    messages=messages,
+                    top_k=5,
+                    session_id=session_id,
+                )
                 messages.append({"role": "assistant", "content": response})
-                console.print(Panel(Markdown(response), title="[bold green]RageBot[/bold green]", border_style="green"))
+                console.print(Panel(
+                    Markdown(response),
+                    title="[bold green]RageBot[/bold green]",
+                    border_style="green",
+                ))
             except Exception as e:
                 display.error(f"Error: {e}")
                 messages.pop()
@@ -296,7 +396,7 @@ def cmd_init(
             result = eng.initialize(force=force)
             progress.update(task, description=f"Initialised [bold]{result['file_count']}[/bold] files")
         display.success(f"Initialised at [bold]{result['path']}[/bold]")
-        display.info(f"RageBot tables created securely.")
+        display.info("RageBot tables created securely.")
         display.info(f"[bold]{result['file_count']}[/bold] indexable files found.")
         display.info("Run [bold cyan]rage save[/bold cyan] to index the project.")
     except Exception as e:
@@ -305,32 +405,23 @@ def cmd_init(
 
 @app.command("save")
 def cmd_save(
-    path:          str            = typer.Argument(".", help="Project directory"),
-    incremental:   bool           = typer.Option(True, "--incremental/--full"),
-    snapshot_name: Optional[str]  = typer.Option(None, "--name", "-n"),
+    path:          str           = typer.Argument(".", help="Project directory"),
+    incremental:   bool          = typer.Option(True, "--incremental/--full"),
+    snapshot_name: Optional[str] = typer.Option(None, "--name", "-n"),
 ):
     """💾 Index the project and save a context snapshot."""
     try:
         eng = _engine(path)
-        # Check if initialized, if not, do it now
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold cyan]{task.description}"),
-            BarColumn(bar_width=40),
-            MofNCompleteColumn(),
-            console=console,
-            transient=True,
-        ) as progress:
-            task = progress.add_task("Indexing...", total=100)
-            
-            def update_prog(current, total, filename):
-                progress.update(task, total=total, completed=current, description=f"Indexing [dim]{filename[:30]}...[/dim]")
+        if not (eng.project_path / ".ragebot" / "ragebot.db").exists():
+            display.info("Project not initialized — running init first…")
+            eng.initialize()
 
-            result = eng.save(incremental=incremental, snapshot_name=snapshot_name, progress_callback=update_prog)
+        with _spin("Indexing project…"):
+            result = eng.save(incremental=incremental, snapshot_name=snapshot_name)
 
         table = Table(title="📊 Indexing Summary", box=None, show_header=True, header_style="bold cyan")
-        table.add_column("Metric", style="cyan", min_width=20)
-        table.add_column("Value",  style="green")
+        table.add_column("Metric",  style="cyan",  min_width=20)
+        table.add_column("Value",   style="green")
         table.add_row("Files Indexed",    str(result["indexed"]))
         table.add_row("Files Skipped",    str(result["skipped"]))
         table.add_row("Snapshot Name",    result["snapshot_name"])
@@ -386,46 +477,74 @@ def cmd_chat(
         eng = _engine(path)
         sid = session_id or f"sess_{uuid.uuid4().hex[:8]}"
         console.print(Panel(f"[bold cyan]RageBot Chat[/bold cyan] • Session: [dim]{sid}[/dim]", border_style="cyan"))
-        history: list[dict] = eng.db.get_chat_history(sid, limit=40)
+        history:  list[dict] = eng.db.get_chat_history(sid, limit=40)
         messages: list[dict] = [{"role": m["role"], "content": m["content"]} for m in history]
+
         while True:
             try:
                 user_input = Prompt.ask("[bold cyan]You[/bold cyan]").strip()
-            except (KeyboardInterrupt, EOFError): break
-            if not user_input: continue
+            except (KeyboardInterrupt, EOFError):
+                break
+            if not user_input:
+                continue
             if user_input.startswith("/"):
                 cmd = user_input.lower()
-                if cmd in ("/exit", "/quit"): break
+                if cmd in ("/exit", "/quit"):
+                    break
                 elif cmd == "/clear":
-                    eng.db.delete_chat_session(sid); messages = []; display.success("Session cleared."); continue
-                else: display.warning(f"Unknown command: {user_input}"); continue
+                    eng.db.delete_chat_session(sid)
+                    eng.clear_context_cache(sid)
+                    messages = []
+                    display.success("Session cleared.")
+                    continue
+                else:
+                    display.warning(f"Unknown command: {user_input}")
+                    continue
+
+            # Detect edit intent before sending to LLM
+            file_path, instruction = _detect_edit_intent(user_input, eng)
+            if file_path and instruction:
+                _show_diff_and_confirm(eng, file_path, instruction)
+                messages.append({"role": "user",     "content": user_input})
+                messages.append({"role": "assistant", "content": f"[Edited {file_path}]"})
+                eng.db.save_chat_message(sid, "user",      user_input)
+                eng.db.save_chat_message(sid, "assistant", f"[Edited {file_path}]")
+                continue
+
             messages.append({"role": "user", "content": user_input})
             eng.db.save_chat_message(sid, "user", user_input)
-            with _spin("Thinking…"): response = eng.chat(messages=messages, top_k=top_k)
+
+            with _spin("Thinking…"):
+                response = eng.chat(messages=messages, top_k=top_k, session_id=sid)
+
             messages.append({"role": "assistant", "content": response})
             eng.db.save_chat_message(sid, "assistant", response)
             console.print(Panel(Markdown(response), title="[bold green]RageBot[/bold green]", border_style="green"))
-    except Exception as e: display.error(f"Error: {e}")
+
+    except Exception as e:
+        display.error(f"Error: {e}")
 
 
 @app.command("search")
 def cmd_search(
-    query:       str = typer.Argument(..., help="Search query"),
-    path:        str = typer.Option(".", "--path", "-p"),
-    search_type: str = typer.Option("semantic", "--type", "-t"),
-    top_k:       int = typer.Option(10, "--top-k", "-k"),
-    show_preview:bool= typer.Option(True, "--preview/--no-preview"),
+    query:        str  = typer.Argument(..., help="Search query"),
+    path:         str  = typer.Option(".", "--path", "-p"),
+    search_type:  str  = typer.Option("semantic", "--type", "-t"),
+    top_k:        int  = typer.Option(10, "--top-k", "-k"),
+    show_preview: bool = typer.Option(True, "--preview/--no-preview"),
 ):
     """🔎 Search project files."""
     try:
         eng = _engine(path)
         with _spin(f"Searching: {query!r}…"):
             results = eng.search(query=query, search_type=search_type, top_k=top_k)
-        t = Table(title=f"🔎 Results", box=None, header_style="bold cyan")
+        t = Table(title="🔎 Results", box=None, header_style="bold cyan")
         t.add_column("File"); t.add_column("Score"); t.add_column("Preview")
-        for r in results: t.add_row(r.get("file",""), f"{r.get('score',0):.3f}", r.get("preview","")[:80])
+        for r in results:
+            t.add_row(r.get("file",""), f"{r.get('score',0):.3f}", r.get("preview","")[:80])
         console.print(t)
-    except Exception as e: display.error(f"Error: {e}")
+    except Exception as e:
+        display.error(f"Error: {e}")
 
 
 @app.command("status")
@@ -433,7 +552,6 @@ def cmd_status(path: str = typer.Argument(".", help="Project directory")):
     """📡 Show index status and LLM health."""
     try:
         eng = _engine(path)
-        # Safely get status even if DB doesn't exist
         db_exists = (eng.rage_dir / "ragebot.db").exists()
         if not db_exists:
             display.warning(f"Project at {path} is not initialized.")
@@ -456,46 +574,73 @@ def cmd_status(path: str = typer.Argument(".", help="Project directory")):
 def cmd_version():
     console.print(Panel("[bold cyan]RageBot MCP[/bold cyan]  v1.0.0\nIntelligent Project Context Engine", border_style="cyan"))
 
+
 # ── EXPLAIN ───────────────────────────────────────────────────────────────────
 @app.command("explain")
 def cmd_explain(file_path: str, symbol: Optional[str] = None, path: str = "."):
     """📖 Explain a file or symbol."""
     try:
         eng = _engine(path)
-        with _spin(f"Explaining {file_path}…"): result = eng.explain(file_path, symbol)
-        if "error" in result: display.error(result["error"]); return
+        with _spin(f"Explaining {file_path}…"):
+            result = eng.explain(file_path, symbol)
+        if "error" in result:
+            display.error(result["error"]); return
         console.print(Panel(Markdown(result.get("explanation", "")), title="💡 Explanation", border_style="green"))
-    except Exception as e: display.error(f"Error: {e}")
+    except Exception as e:
+        display.error(f"Error: {e}")
 
-# ── DOCS / TEST ──────────────────────────────────────────────────────────────
+
+# ── DOCS / TEST ───────────────────────────────────────────────────────────────
 @app.command("docs")
 def cmd_docs(file_path: str, path: str = ".", output: Optional[str] = None):
     """📝 Generate documentation."""
     try:
         eng = _engine(path)
-        with _spin(f"Generating docs…"): docs = eng.generate_docs(file_path)
+        with _spin("Generating docs…"):
+            docs = eng.generate_docs(file_path)
         console.print(Panel(Markdown(docs), border_style="cyan"))
-    except Exception as e: display.error(f"Error: {e}")
+    except Exception as e:
+        display.error(f"Error: {e}")
+
 
 @app.command("test")
 def cmd_test(file_path: str, path: str = ".", output: Optional[str] = None):
     """🧪 Generate tests."""
     try:
         eng = _engine(path)
-        with _spin(f"Generating tests…"): tests = eng.generate_tests(file_path)
+        with _spin("Generating tests…"):
+            tests = eng.generate_tests(file_path)
         console.print(Panel(Syntax(tests, "python"), border_style="cyan"))
-    except Exception as e: display.error(f"Error: {e}")
+    except Exception as e:
+        display.error(f"Error: {e}")
+
 
 @app.command("context")
 def cmd_context(path: str = ".", tree: bool = False):
     """📋 Show project context."""
     try:
         eng = _engine(path)
-        if tree: console.print(eng.get_file_tree()["tree"])
+        if tree:
+            console.print(eng.get_file_tree()["tree"])
         else:
             stats = eng.get_project_overview()
-            for k, v in stats.items(): console.print(f"{k}: {v}")
-    except Exception as e: display.error(f"Error: {e}")
+            for k, v in stats.items():
+                console.print(f"{k}: {v}")
+    except Exception as e:
+        display.error(f"Error: {e}")
+
+
+# ── CONFIG SHOW ───────────────────────────────────────────────────────────────
+def cfg_show():
+    cfg = ConfigManager()
+    all_cfg = cfg.get_all()
+    t = Table(title="⚙️  RageBot Config", box=None, header_style="bold cyan", show_edge=False, padding=(0, 2))
+    t.add_column("Key",   style="cyan",  min_width=28)
+    t.add_column("Value", style="white")
+    for k, v in sorted(all_cfg.items()):
+        t.add_row(k, str(v))
+    console.print(t)
+
 
 
 @app.command("list")
@@ -529,30 +674,24 @@ app.add_typer(auth_app, name="auth")
 def _do_auth_menu():
     console.print()
     console.print(Panel("[bold cyan]🔐  RageBot Auth Manager[/bold cyan]", border_style="cyan", padding=(1, 3)))
-    choice = questionary.select(
-        "Select an action:",
-        choices=[
-            questionary.Choice("Login", value="1"),
-            questionary.Choice("Logout", value="2"),
-            questionary.Choice("Status", value="3"),
-            questionary.Choice("Switch Provider", value="4"),
-            questionary.Choice("Cancel", value="5"),
-        ]
-    ).ask()
-    if choice == "1": _do_login_interactive()
+    choice = Prompt.ask("\n[bold]1. Login  2. Logout  3. Status  4. Switch[/bold]", choices=["1","2","3","4"])
+    if   choice == "1": _do_login_interactive()
     elif choice == "2": _do_logout_interactive()
     elif choice == "3": _do_auth_status()
     elif choice == "4": _do_switch_interactive()
 
 @auth_app.callback()
 def auth_callback(ctx: typer.Context):
-    if ctx.invoked_subcommand is None: _do_auth_menu()
+    if ctx.invoked_subcommand is None:
+        _do_auth_menu()
 
 def _do_login_interactive(provider: str | None = None):
-    if not provider: provider = _select_provider()
-    key = questionary.password("  API Key: ").ask()
-    if key: 
-        cfg = ConfigManager()
+    import getpass
+    if not provider:
+        provider = _select_provider()
+    key = getpass.getpass("  API Key: ").strip()
+    if key:
+        cfg   = ConfigManager()
         cfg.set(f"{provider}_api_key", key)
         model = _select_model(provider)
         cfg.set(f"{provider}_model", model)
@@ -560,17 +699,27 @@ def _do_login_interactive(provider: str | None = None):
         display.success("Authenticated!")
 
 def _do_auth_status():
-    cfg = ConfigManager(); active = cfg.get("llm_provider", "none")
+    cfg    = ConfigManager()
+    active = cfg.get("llm_provider", "none")
     for p in PROVIDERS:
-        key = cfg.get(f"{p}_api_key", ""); act = " ★" if p == active else ""
+        key = cfg.get(f"{p}_api_key", "")
+        act = " ★" if p == active else ""
         console.print(f"{p}: {'[green]OK[/green]' if key else '[red]Missing[/red]'}{act}")
 
 def _do_logout_interactive():
-    p = _select_provider(); ConfigManager().delete_secret(f"{p}_api_key"); display.success("Logged out.")
+    p = _select_provider()
+    ConfigManager().delete_secret(f"{p}_api_key")
+    display.success("Logged out.")
 
 def _do_switch_interactive():
-    p = _select_provider(); ConfigManager().set("llm_provider", p); display.success(f"Switched to {p}")
+    p = _select_provider()
+    ConfigManager().set("llm_provider", p)
+    display.success(f"Switched to {p}")
 
-def main() -> None: app()
 
-if __name__ == "__main__": main()
+def main() -> None:
+    app()
+
+
+if __name__ == "__main__":
+    main()
