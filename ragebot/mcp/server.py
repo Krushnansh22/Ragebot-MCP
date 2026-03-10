@@ -25,8 +25,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from ragebot.core.config  import ConfigManager
-from ragebot.core.engine  import RageBotEngine
+from ragebot.core.config import ConfigManager
+from ragebot.core.engine import RageBotEngine
 
 logger = logging.getLogger("ragebot.mcp")
 
@@ -48,9 +48,10 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query":  {"type": "string",  "description": "The question to ask"},
-                "mode":   {"type": "string",  "enum": ["minimal","smart","full"], "default": "smart"},
-                "top_k":  {"type": "integer", "default": 5, "description": "Max context chunks"},
+                "query":      {"type": "string",  "description": "The question to ask"},
+                "mode":       {"type": "string",  "enum": ["minimal","smart","full"], "default": "smart"},
+                "top_k":      {"type": "integer", "default": 5, "description": "Max context chunks"},
+                "session_id": {"type": "string",  "description": "Session ID for context continuity"},
             },
             "required": ["query"],
         },
@@ -74,8 +75,8 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "incremental":     {"type": "boolean", "default": True},
-                "snapshot_name":   {"type": "string"},
+                "incremental":   {"type": "boolean", "default": True},
+                "snapshot_name": {"type": "string"},
             },
         },
     },
@@ -146,6 +147,23 @@ TOOLS: list[dict] = [
             "required": ["diff"],
         },
     },
+    {
+        "name": "ragebot_apply_edit",
+        "description": (
+            "Apply a natural language edit instruction to a source file. "
+            "Returns the unified diff of proposed changes. "
+            "Set write=true to persist changes to disk and re-index the file."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path":   {"type": "string", "description": "Relative path to the file to edit"},
+                "instruction": {"type": "string", "description": "Plain English edit instruction"},
+                "write":       {"type": "boolean", "default": False, "description": "Write changes to disk"},
+            },
+            "required": ["file_path", "instruction"],
+        },
+    },
 ]
 
 
@@ -153,36 +171,37 @@ class RageBotMCPServer:
     """Handles the MCP JSON-RPC 2.0 protocol over any transport."""
 
     def __init__(self, project_path: Path, config: ConfigManager) -> None:
-        self.engine = RageBotEngine(project_path=project_path, config=config)
+        self.engine       = RageBotEngine(project_path=project_path, config=config)
         self._initialized = False
+        # Per-connection chat sessions: maps session_id → message list
+        self._sessions: dict[str, list[dict]] = {}
 
     # ── Dispatch ──────────────────────────────────────────────────────────────
 
     def handle_request(self, request: dict) -> Optional[dict]:
-        """Process one JSON-RPC request and return a response dict (or None for notifications)."""
         method  = request.get("method", "")
         req_id  = request.get("id")
         params  = request.get("params", {})
 
         handlers = {
-            "initialize":          self._handle_initialize,
-            "initialized":         self._handle_notification,
-            "tools/list":          self._handle_tools_list,
-            "tools/call":          self._handle_tools_call,
-            "ping":                self._handle_ping,
-            "notifications/cancelled": self._handle_notification,
+            "initialize":               self._handle_initialize,
+            "initialized":              self._handle_notification,
+            "tools/list":               self._handle_tools_list,
+            "tools/call":               self._handle_tools_call,
+            "ping":                     self._handle_ping,
+            "notifications/cancelled":  self._handle_notification,
         }
 
         handler = handlers.get(method)
         if handler is None:
             if req_id is None:
-                return None                         # Unknown notification — silently ignore
+                return None
             return self._error(req_id, -32601, f"Method not found: {method}")
 
         try:
             result = handler(params)
             if req_id is None:
-                return None                         # Notification — no response
+                return None
             return {"jsonrpc": "2.0", "id": req_id, "result": result}
         except Exception as exc:
             logger.exception("Error handling %s", method)
@@ -226,6 +245,7 @@ class RageBotMCPServer:
             "ragebot_generate_docs":  self._tool_generate_docs,
             "ragebot_generate_tests": self._tool_generate_tests,
             "ragebot_diff_explain":   self._tool_diff_explain,
+            "ragebot_apply_edit":     self._tool_apply_edit,
         }
 
         fn = dispatchers.get(tool_name)
@@ -245,10 +265,31 @@ class RageBotMCPServer:
     # ── Tool implementations ──────────────────────────────────────────────────
 
     def _tool_ask(self, args: dict) -> dict:
+        """
+        Multi-turn aware ask: if a session_id is supplied, routes through
+        engine.chat() (with history and context cache) instead of engine.ask().
+        """
+        session_id = args.get("session_id")
+        query      = args["query"]
+        top_k      = int(args.get("top_k", 5))
+
+        if session_id:
+            # Build or extend the session message history
+            history = self._sessions.setdefault(session_id, [])
+            history.append({"role": "user", "content": query})
+            answer = self.engine.chat(
+                messages=history,
+                top_k=top_k,
+                session_id=session_id,
+            )
+            history.append({"role": "assistant", "content": answer})
+            return {"query": query, "answer": answer, "session_id": session_id}
+
+        # Stateless single-turn ask
         return self.engine.ask(
-            query=args["query"],
+            query=query,
             mode=args.get("mode", "smart"),
-            top_k=int(args.get("top_k", 5)),
+            top_k=top_k,
         )
 
     def _tool_search(self, args: dict) -> list:
@@ -291,6 +332,13 @@ class RageBotMCPServer:
     def _tool_diff_explain(self, args: dict) -> str:
         return self.engine.diff_explain(args["diff"])
 
+    def _tool_apply_edit(self, args: dict) -> dict:
+        return self.engine.apply_file_edit(
+            file_path=args["file_path"],
+            instruction=args["instruction"],
+            write=bool(args.get("write", False)),
+        )
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -301,7 +349,6 @@ class RageBotMCPServer:
 # ── Transports ────────────────────────────────────────────────────────────────
 
 def run_stdio(server: RageBotMCPServer) -> None:
-    """Run the MCP server over stdin/stdout (newline-delimited JSON-RPC)."""
     logger.info("RageBot MCP server started (stdio transport)")
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()
@@ -321,7 +368,6 @@ def run_stdio(server: RageBotMCPServer) -> None:
 
 
 def run_sse(server: RageBotMCPServer, host: str = "127.0.0.1", port: int = 8765) -> None:
-    """Run the MCP server over HTTP/SSE."""
     try:
         from fastapi import FastAPI, Request
         from fastapi.responses import StreamingResponse, JSONResponse
@@ -333,7 +379,7 @@ def run_sse(server: RageBotMCPServer, host: str = "127.0.0.1", port: int = 8765)
             f"Original error: {exc}"
         ) from exc
 
-    sse_app = FastAPI(title="RageBot MCP Server")
+    sse_app  = FastAPI(title="RageBot MCP Server")
     _sessions: dict[str, list[dict]] = {}
 
     @sse_app.get("/health")
@@ -342,13 +388,12 @@ def run_sse(server: RageBotMCPServer, host: str = "127.0.0.1", port: int = 8765)
 
     @sse_app.post("/mcp")
     async def mcp_endpoint(req: Request):
-        body    = await req.json()
+        body     = await req.json()
         response = server.handle_request(body)
         return JSONResponse(content=response or {})
 
     @sse_app.get("/sse/{session_id}")
     async def sse_stream(session_id: str):
-        """SSE endpoint: client subscribes, server pushes events."""
         _sessions[session_id] = []
 
         async def event_generator():
@@ -393,7 +438,6 @@ def main() -> None:
     project_path = Path(args.project).resolve()
     server       = RageBotMCPServer(project_path=project_path, config=config)
 
-    # Auto-init if not yet done
     if not (project_path / ".ragebot" / "ragebot.db").exists():
         server.engine.initialize()
 

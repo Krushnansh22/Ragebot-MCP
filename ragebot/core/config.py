@@ -31,13 +31,15 @@ _SECRET_KEYS: set[str] = {"gemini_api_key", "groq_api_key"}
 
 # Env-var → config-key mapping
 _ENV_MAP: dict[str, str] = {
-    "GEMINI_API_KEY":          "gemini_api_key",
-    "GROQ_API_KEY":            "groq_api_key",
-    "RAGEBOT_LLM_PROVIDER":    "llm_provider",
-    "RAGEBOT_EMBEDDING_MODEL": "embedding_model",
-    "RAGEBOT_MCP_TRANSPORT":   "mcp_transport",
-    "RAGEBOT_MCP_HOST":        "mcp_host",
-    "RAGEBOT_MCP_PORT":        "mcp_port",
+    "GEMINI_API_KEY":                "gemini_api_key",
+    "GROQ_API_KEY":                  "groq_api_key",
+    "RAGEBOT_LLM_PROVIDER":          "llm_provider",
+    "RAGEBOT_EMBEDDING_MODEL":       "embedding_model",
+    "RAGEBOT_MCP_TRANSPORT":         "mcp_transport",
+    "RAGEBOT_MCP_HOST":              "mcp_host",
+    "RAGEBOT_MCP_PORT":              "mcp_port",
+    "RAGEBOT_CONTEXT_WINDOW_TURNS":  "context_window_turns",
+    "RAGEBOT_CONTEXT_CACHE_ENABLED": "context_cache_enabled",
 }
 
 # ── Non-secret defaults ───────────────────────────────────────────────────────
@@ -70,6 +72,13 @@ DEFAULTS: dict[str, str] = {
     "mcp_host":            "127.0.0.1",
     "mcp_port":            "8765",
     "mcp_transport":       "stdio",
+    # ── Context & Retrieval ───────────────────────────────────────────────────
+    # Number of recent conversation turns whose text is blended into the
+    # semantic retrieval query.  Higher = more context-aware but slower.
+    "context_window_turns":  "3",
+    # Persist retrieved-context cache to .ragebot/context_cache.json so that
+    # follow-up questions in a new CLI session still benefit from prior turns.
+    "context_cache_enabled": "true",
 }
 
 
@@ -78,7 +87,6 @@ DEFAULTS: dict[str, str] = {
 def _keyring_available() -> bool:
     try:
         import keyring                                          # type: ignore
-        # Some systems have keyring installed but no backend configured
         keyring.get_keyring()
         return True
     except Exception:
@@ -114,7 +122,6 @@ def _keyring_delete(key: str) -> bool:
 # ── Secrets-file helpers (chmod-600 fallback) ─────────────────────────────────
 
 def _secrets_file_read() -> dict[str, str]:
-    """Read ~/.config/ragebot/.secrets (ini-style KEY=value)."""
     if not SECRETS_FILE.exists():
         return {}
     try:
@@ -131,13 +138,11 @@ def _secrets_file_read() -> dict[str, str]:
 
 
 def _secrets_file_write(key: str, value: str) -> None:
-    """Write a key to ~/.config/ragebot/.secrets and chmod 600."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     current = _secrets_file_read()
     current[key] = value
     lines = [f"{k}={v}" for k, v in current.items()]
     SECRETS_FILE.write_text("\n".join(lines) + "\n")
-    # Restrict to owner only
     try:
         SECRETS_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except Exception:
@@ -164,10 +169,8 @@ class ConfigManager:
     # ── Load ──────────────────────────────────────────────────────────────────
 
     def _load(self) -> None:
-        # 1. Start from defaults
         self._data = dict(DEFAULTS)
 
-        # 2. Merge persisted non-secret config (secrets are never stored here)
         if CONFIG_FILE.exists():
             try:
                 stored = json.loads(CONFIG_FILE.read_text())
@@ -176,19 +179,16 @@ class ConfigManager:
             except Exception:
                 pass
 
-        # 2b. Migrate: ensure .ragebot is in ignore_patterns (added in v1.0.0)
         ig = self._data.get("ignore_patterns", "")
         if ".ragebot" not in ig:
             self._data["ignore_patterns"] = ig.rstrip(",") + ",.ragebot"
 
-        # 3. Environment variable overrides (highest priority)
         for env_key, cfg_key in _ENV_MAP.items():
             val = os.environ.get(env_key)
             if val:
                 self._data[cfg_key] = val
 
     def _save(self) -> None:
-        """Persist non-secret config to disk."""
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         safe = {k: v for k, v in self._data.items() if k not in _SECRET_KEYS}
         CONFIG_FILE.write_text(json.dumps(safe, indent=2))
@@ -196,17 +196,14 @@ class ConfigManager:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def get(self, key: str, default: Any = None) -> Any:
-        """Get a config value. Secrets are resolved from env → keyring → .secrets file."""
         if key in _SECRET_KEYS:
             env_map_rev = {v: k for k, v in _ENV_MAP.items()}
             env_val = os.environ.get(env_map_rev.get(key, ""), "")
             if env_val:
                 return env_val
-            # Try keyring
             kr_val = _keyring_get(key)
             if kr_val:
                 return kr_val
-            # Try .secrets fallback
             sf_val = _secrets_file_read().get(key, "")
             if sf_val:
                 return sf_val
@@ -214,16 +211,9 @@ class ConfigManager:
         return self._data.get(key, default)
 
     def set(self, key: str, value: str) -> dict[str, str]:
-        """
-        Set a config value.
-        • Secrets → OS keyring (preferred) or ~/.config/ragebot/.secrets
-        • Non-secrets → ~/.config/ragebot/config.json
-        Returns {"stored": "keyring"|"file"|"config", "key": key}
-        """
         if key in _SECRET_KEYS:
             if _keyring_available() and _keyring_set(key, value):
                 return {"stored": "keyring", "key": key}
-            # Fallback: write to chmod-600 .secrets file
             _secrets_file_write(key, value)
             return {"stored": "file", "key": key}
         self._data[key] = value
@@ -231,7 +221,6 @@ class ConfigManager:
         return {"stored": "config", "key": key}
 
     def delete_secret(self, key: str) -> bool:
-        """Remove a secret from both keyring and .secrets file."""
         if key not in _SECRET_KEYS:
             return False
         kr_ok = _keyring_delete(key)
@@ -239,7 +228,6 @@ class ConfigManager:
         return kr_ok or sf_ok
 
     def get_all(self) -> dict[str, str]:
-        """Return all settings; secrets are masked."""
         result: dict[str, str] = dict(self._data)
         for k in _SECRET_KEYS:
             val = self.get(k)
